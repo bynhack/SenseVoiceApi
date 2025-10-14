@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>WebSocket Audio Transcription</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 0 20px;
+        }
+        #transcriptionResult {
+            white-space: pre-wrap;
+            background-color: #f5f5f5;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            min-height: 200px;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        .transcript-line {
+            margin: 8px 0;
+            padding: 8px;
+            border-radius: 4px;
+            background-color: white;
+            border-left: 4px solid #ccc;
+        }
+        .speaker-label {
+            font-weight: bold;
+            margin-right: 8px;
+            display: inline-block;
+            min-width: 80px;
+        }
+        .speaker-1 { color: #2196F3; border-left-color: #2196F3; }
+        .speaker-2 { color: #4CAF50; border-left-color: #4CAF50; }
+        .speaker-3 { color: #FF9800; border-left-color: #FF9800; }
+        .speaker-4 { color: #9C27B0; border-left-color: #9C27B0; }
+        .speaker-5 { color: #F44336; border-left-color: #F44336; }
+        .speaker-unknown { color: #757575; border-left-color: #757575; }
+        .new-speaker-notification {
+            background-color: #E3F2FD;
+            color: #1976D2;
+            padding: 6px 10px;
+            border-radius: 4px;
+            margin: 8px 0;
+            font-size: 0.9em;
+            font-style: italic;
+        }
+        #recordButton {
+            padding: 10px 20px;
+            font-size: 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+        }
+        #recordButton.recording {
+            background-color: #f44336;
+        }
+        .controls {
+            margin-bottom: 20px;
+        }
+        .controls label {
+            margin-left: 15px;
+        }
+    </style>
+</head>
+<body>
+    <div>
+        <h2>实时语音识别（支持说话人识别）</h2>
+        <div class="controls">
+            <button id="recordButton">开始录音</button>
+            <label>
+                语言: 
+                <input id="lang" type="text" value="zh" />
+            </label>
+            <label>
+                <input type="checkbox" id="speakerVerification"> 说话人验证（旧功能）
+            </label>
+        </div>
+        <hr />
+        <h3>识别结果：</h3>
+        <div id="transcriptionResult"></div>
+    </div>
+</body>
+<script>
+    var recordButton = document.getElementById('recordButton');
+    var transcriptionResult = document.getElementById('transcriptionResult');
+    navigator.getUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia;
+    var ws = null;
+    var record = null;
+    var clientId = initClientId();
+    var timeInte = null;
+    var isRecording = false;
+
+    recordButton.onclick = function() {
+        if (!isRecording) {
+            startRecording();
+        } else {
+            stopRecording();
+        }
+    };
+
+    function startRecording() {
+        console.log('Start Recording');
+        var speakerVerificationCheckbox = document.getElementById('speakerVerification');
+        var sv = speakerVerificationCheckbox.checked ? 1 : 0;
+        var lang = document.getElementById("lang").value
+        // Construct the query parameters
+        var queryParams = [];
+        if (lang) {
+            queryParams.push(`lang=${lang}`);
+        }
+        if (sv) {
+            queryParams.push('sv=1');
+        }
+        queryParams.push(`client_id=${encodeURIComponent(clientId)}`);
+        var queryString = `?${queryParams.join('&')}`;
+
+        // ws = new WebSocket(`ws://192.168.2.43:27000/ws/transcribe${queryString}`);
+        ws = new WebSocket(`ws://192.168.1.88:27100/ws/transcribe${queryString}`);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = function(event) {
+            console.log('WebSocket connection established');
+            record.start();
+            timeInte = setInterval(function() {
+                if(ws.readyState === 1) {
+                    var audioBlob = record.getBlob();
+                    console.log('Blob size: ', audioBlob.size);
+
+                    // Read the Blob content for debugging
+                    var reader = new FileReader();
+                    reader.onloadend = function() {
+                        console.log('Blob content: ', new Uint8Array(reader.result));
+                        ws.send(audioBlob);
+                        console.log('Sending audio data');
+                        record.clear();
+                    };
+                    reader.readAsArrayBuffer(audioBlob);
+                }
+            }, 500);
+        };
+
+        ws.onmessage = function(evt) {
+            console.log('Received message: ' + evt.data);
+            try {
+                var resJson = JSON.parse(evt.data);
+                
+                // code=0: ASR识别结果
+                if (resJson.code == 0) {
+                    var speaker = resJson.speaker || 'unknown';
+                    var text = resJson.data || 'No speech recognized';
+                    addTranscriptLine(speaker, text);
+                }
+                // code=4: 检测到新说话人
+                else if (resJson.code == 4) {
+                    var speakerId = resJson.data;
+                    addNewSpeakerNotification(speakerId);
+                }
+                // code=3: 声纹登记完成
+                else if (resJson.code == 3) {
+                    console.log('Speaker enrolled:', resJson.data);
+                }
+                // code=2: 检测到说话人/语音
+                else if (resJson.code == 2) {
+                    console.log('Speaker/Speech detected:', resJson.data);
+                }
+            } catch (e) {
+                console.error('Failed to parse response data', e);
+                transcriptionResult.textContent += "\n" + evt.data;
+            }
+        };
+        
+        function addTranscriptLine(speaker, text) {
+            var line = document.createElement('div');
+            line.className = 'transcript-line';
+            
+            // 根据说话人ID添加不同的样式
+            var speakerNum = speaker.replace('speaker_', '');
+            if (speakerNum && !isNaN(speakerNum)) {
+                line.classList.add('speaker-' + speakerNum);
+            } else {
+                line.classList.add('speaker-unknown');
+            }
+            
+            var speakerLabel = document.createElement('span');
+            speakerLabel.className = 'speaker-label';
+            speakerLabel.textContent = '说话人' + (speakerNum || '?') + ':';
+            
+            var textSpan = document.createElement('span');
+            textSpan.textContent = text;
+            
+            line.appendChild(speakerLabel);
+            line.appendChild(textSpan);
+            transcriptionResult.appendChild(line);
+            
+            // 自动滚动到底部
+            transcriptionResult.scrollTop = transcriptionResult.scrollHeight;
+        }
+        
+        function addNewSpeakerNotification(speakerId) {
+            var notification = document.createElement('div');
+            notification.className = 'new-speaker-notification';
+            var speakerNum = speakerId.replace('speaker_', '');
+            notification.textContent = '🎤 检测到新说话人：说话人' + speakerNum;
+            transcriptionResult.appendChild(notification);
+            
+            // 自动滚动到底部
+            transcriptionResult.scrollTop = transcriptionResult.scrollHeight;
+        }
+
+        ws.onclose = function() {
+            console.log('WebSocket connection closed');
+        };
+
+        ws.onerror = function(error) {
+            console.error('WebSocket error: ' + error);
+        };
+
+        recordButton.textContent = "停止录音";
+        recordButton.classList.add("recording");
+        isRecording = true;
+    }
+
+    function stopRecording() {
+        console.log('Stop Recording');
+        if (ws) {
+            ws.close();
+            record.stop();
+            clearInterval(timeInte);
+        }
+        recordButton.textContent = "开始录音";
+        recordButton.classList.remove("recording");
+        isRecording = false;
+        
+        // 清空识别结果
+        // transcriptionResult.innerHTML = '';
+    }
+
+    function init(rec) {
+        record = rec;
+    }
+
+    function initClientId() {
+        var storageKey = 'ws_client_id';
+        var stored = window.localStorage ? window.localStorage.getItem(storageKey) : null;
+        if (stored) {
+            return stored;
+        }
+        var generated = `web_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        try {
+            window.localStorage && window.localStorage.setItem(storageKey, generated);
+        } catch (e) {
+            console.warn('Failed to persist client_id, will use ephemeral value.', e);
+        }
+        return generated;
+    }
+
+    if (!navigator.getUserMedia) {
+        alert('Your browser does not support audio input');
+    } else {
+        navigator.getUserMedia(
+            { audio: true },
+            function(mediaStream) {
+                init(new Recorder(mediaStream));
+            },
+            function(error) {
+                console.log(error);
+            }
+        );
+    }
+
+    var Recorder = function(stream) {
+        var sampleBits = 16; // Sample bits
+        var inputSampleRate = 48000; // Input sample rate
+        var outputSampleRate = 16000; // Output sample rate
+        var channelCount = 1; // Single channel
+        var context = new AudioContext();
+        var audioInput = context.createMediaStreamSource(stream);
+        var recorder = context.createScriptProcessor(4096, channelCount, channelCount);
+        var audioData = {
+            size: 0,
+            buffer: [],
+            inputSampleRate: inputSampleRate,
+            inputSampleBits: sampleBits,
+            clear: function() {
+                this.buffer = [];
+                this.size = 0;
+            },
+            input: function(data) {
+                this.buffer.push(new Float32Array(data));
+                this.size += data.length;
+            },
+            encodePCM: function() {
+                var bytes = new Float32Array(this.size);
+                var offset = 0;
+                for (var i = 0; i < this.buffer.length; i++) {
+                    bytes.set(this.buffer[i], offset);
+                    offset += this.buffer[i].length;
+                }
+                var dataLength = bytes.length * (sampleBits / 8);
+                var buffer = new ArrayBuffer(dataLength);
+                var data = new DataView(buffer);
+                offset = 0;
+                for (var i = 0; i < bytes.length; i++, offset += 2) {
+                    var s = Math.max(-1, Math.min(1, bytes[i]));
+                    data.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+                }
+                return new Blob([data], { type: 'audio/pcm' });
+            }
+        };
+
+        this.start = function() {
+            audioInput.connect(recorder);
+            recorder.connect(context.destination);
+        };
+
+        this.stop = function() {
+            recorder.disconnect();
+        };
+
+        this.getBlob = function() {
+            return audioData.encodePCM();
+        };
+
+        this.clear = function() {
+            audioData.clear();
+        };
+
+        function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
+            if (outputSampleRate === inputSampleRate) {
+                return buffer;
+            }
+            var sampleRateRatio = inputSampleRate / outputSampleRate;
+            var newLength = Math.round(buffer.length / sampleRateRatio);
+            var result = new Float32Array(newLength);
+            var offsetResult = 0;
+            var offsetBuffer = 0;
+            while (offsetResult < result.length) {
+                var nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+                var accum = 0, count = 0;
+                for (var i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                    accum += buffer[i];
+                    count++;
+                }
+                result[offsetResult] = accum / count;
+                offsetResult++;
+                offsetBuffer = nextOffsetBuffer;
+            }
+            return result;
+        }
+
+        recorder.onaudioprocess = function(e) {
+            console.log('onaudioprocess called');
+            var resampledData = downsampleBuffer(e.inputBuffer.getChannelData(0), inputSampleRate, outputSampleRate);
+            audioData.input(resampledData);
+        };
+    };
+
+</script>
+</html>
