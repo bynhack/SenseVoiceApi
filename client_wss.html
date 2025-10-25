@@ -121,7 +121,7 @@
         var queryString = `?${queryParams.join('&')}`;
 
         // ws = new WebSocket(`ws://192.168.2.43:27000/ws/transcribe${queryString}`);
-        ws = new WebSocket(`ws://192.168.1.88:27100/ws/transcribe${queryString}`);
+        ws = new WebSocket(`ws://127.0.0.1:27100/ws/transcribe${queryString}`);
         ws.binaryType = 'arraybuffer';
 
         ws.onopen = function(event) {

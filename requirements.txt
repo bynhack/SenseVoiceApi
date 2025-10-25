@@ -17,3 +17,6 @@ simplejson
 sortedcontainers
 websockets
 loguru
+httpx
+python-multipart
+socksio

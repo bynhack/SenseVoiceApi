@@ -22,17 +22,18 @@
 
 ```
 sensevoice/
-├── server_wss_v3.py          # WebSocket 区分说话人
-├── server_wss_v2.py          # WebSocket 区分说话人 只识别当前说话人
-├── server_wss.py             # WebSocket 
-├── server.py                 # HTTP API 
+├── server_wss_v3.py          # WebSocket 服务（支持说话人识别、降噪、错误修正）
+├── server.py                 # HTTP API 服务（支持音频和视频转写）
 ├── model.py                  # SenseVoice 模型定义（支持微调）
 ├── client_wss.html           # WebSocket 客户端测试页面
 ├── requirements.txt          # Python 依赖包
-├── realtime_shell.py         # 实时命令行测试工具
-├── README_realtime_shell.md  # 实时测试工具说明
-└── outputs/                  # 模型微调输出目录
-    └── model.pt.avg10        # 微调后的平均权重文件
+├── outputs/                  # 模型微调输出目录
+│   └── model.pt.avg10        # 微调后的平均权重文件
+└── docs/                     # 文档目录
+    ├── DOCKER.md            # Docker 部署指南
+    ├── API_USAGE.md         # API 使用文档
+    ├── DOUYIN_DOWNLOAD.md   # 抖音视频下载说明
+    └── TROUBLESHOOTING.md   # 故障排查指南
 ```
 
 ## 环境要求
@@ -67,6 +68,8 @@ python server_wss_v3.py --port 27100
 ```
 
 服务器将在 `ws://0.0.0.0:27100/ws/transcribe` 上监听 WebSocket 连接。
+
+**注意**：服务会自动检测并使用可用的 GPU 进行加速。如果没有 GPU，会回退到 CPU 模式。
 
 ### 配置参数
 
@@ -327,6 +330,15 @@ model_vad = AutoModel(
 - **PyTorch**：深度学习框架
 - **NumPy/SciPy**：音频信号处理
 - **Loguru**：日志记录
+
+## 文档
+
+更多详细文档请参考 [docs/](docs/) 目录：
+
+- [Docker 部署指南](docs/DOCKER.md) - Docker 构建和部署说明
+- [API 使用文档](docs/API_USAGE.md) - API 接口使用说明
+- [抖音视频下载说明](docs/DOUYIN_DOWNLOAD.md) - 抖音视频下载和转写说明
+- [故障排查指南](docs/TROUBLESHOOTING.md) - 常见问题排查和解决方案
 
 ## 许可证
 

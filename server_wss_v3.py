@@ -24,6 +24,12 @@ from difflib import SequenceMatcher
 from collections import defaultdict
 import scipy.signal as signal
 from scipy.signal import butter, lfilter, wiener
+import torch
+import httpx
+import subprocess
+import tempfile
+import io
+import shutil
 
 logger.remove()
 log_format = "{time:YYYY-MM-DD HH:mm:ss} [{level}] {file}:{line} - {message}"
@@ -654,11 +660,15 @@ else:
     logger.info(f"使用本地缓存的 ASR 模型: {asr_model_cache}")
 
 # 先加载原始模型
+# 检查CUDA是否可用
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+logger.info(f"使用设备: {device}")
+
 model_asr = AutoModel(
     model=asr_model_cache,
     trust_remote_code=True,
     remote_code="./model.py",    
-    device="cuda:0",
+    device=device,
     disable_update=True,
     initial_model="./outputs/model.pt.avg10"  # 加载微调后的平均权重(推荐)
 )
@@ -1084,6 +1094,312 @@ async def websocket_endpoint(websocket: WebSocket):
         audio_vad = np.array([], dtype=np.float32)
         cache.clear()
         logger.info(f"Cleaned up resources after WebSocket disconnect, client_id={client_id}")
+
+
+def is_direct_video_url(url: str) -> bool:
+    """检查是否为视频直链"""
+    video_extensions = ['.mp4', '.webm', '.m3u8', '.flv', '.avi', '.mov', '.mkv']
+    douyin_cdn_patterns = [
+        r'aweme\.snssdk\.com',
+        r'v[0-9]+\.pstatp\.com',
+        r'/aweme/',
+        r'/video/tos/',
+    ]
+    return (
+        any(url.lower().endswith(ext) for ext in video_extensions) or
+        any(re.search(pattern, url, re.IGNORECASE) for pattern in douyin_cdn_patterns)
+    )
+
+
+def get_douyin_headers() -> dict:
+    """获取抖音下载所需的 headers"""
+    return {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.douyin.com/',
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Sec-Fetch-Dest': 'video',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Site': 'cross-site',
+    }
+
+
+async def download_and_process_audio(audio_url: str) -> np.ndarray:
+    """
+    下载音频或视频并提取音频，返回处理后的音频数组
+    
+    Args:
+        audio_url: 音频/视频 URL
+        
+    Returns:
+        audio_data: 音频数据 (16kHz, float32)
+    """
+    temp_dir = tempfile.mkdtemp()
+    
+    try:
+        # 检查是否为视频直链
+        is_video = is_direct_video_url(audio_url)
+        
+        # 判断是否需要特殊 headers（抖音等）
+        headers = None
+        if 'douyin' in audio_url.lower() or 'aweme' in audio_url.lower():
+            headers = get_douyin_headers()
+        
+        # 下载文件
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            follow_redirects=True,
+            verify=True,
+            http2=False,
+        ) as client:
+            response = await client.get(audio_url, headers=headers)
+            if response.status_code != 200:
+                raise Exception(f"下载失败，状态码: {response.status_code}")
+            file_bytes = response.content
+        
+        # 根据文件类型处理
+        if is_video:
+            # 视频文件：保存并提取音频
+            video_file = os.path.join(temp_dir, 'video.mp4')
+            with open(video_file, 'wb') as f:
+                f.write(file_bytes)
+            
+            audio_file = os.path.join(temp_dir, 'audio.wav')
+            cmd = [
+                'ffmpeg',
+                '-i', video_file,
+                '-vn',
+                '-acodec', 'pcm_s16le',
+                '-ar', '16000',
+                '-ac', '1',
+                '-y',
+                audio_file
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                raise Exception(f"音频提取失败: {result.stderr}")
+            
+            # 读取音频文件
+            audio_data, sr = sf.read(audio_file, dtype=np.int16)
+            audio_data = audio_data.astype(np.float32) / 32767.0
+        else:
+            # 音频文件：直接读取
+            bio = io.BytesIO(file_bytes)
+            audio_data, sr = sf.read(bio, dtype=np.int16)
+            audio_data = audio_data.astype(np.float32) / 32767.0
+        
+        # 确保采样率为 16kHz
+        if sr != 16000:
+            logger.info(f"[流式转写] 采样率 {sr} Hz，重采样到 16000 Hz")
+            import torchaudio
+            resampler = torchaudio.transforms.Resample(sr, 16000)
+            audio_tensor = torch.from_numpy(audio_data).to(torch.float32)
+            audio_data = resampler(audio_tensor[None, :])[0, :].numpy()
+        
+        # 处理多声道
+        if len(audio_data.shape) > 1:
+            audio_data = audio_data.mean(-1)
+        
+        logger.info(f"[流式转写] 音频加载完成，时长: {len(audio_data) / 16000:.2f} 秒")
+        return audio_data
+        
+    except Exception as e:
+        logger.error(f"[流式转写] 音频处理失败: {e}")
+        raise
+    finally:
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception as e:
+            logger.warning(f"[流式转写] 清理临时文件失败: {e}")
+
+
+@app.websocket("/ws/transcribe_file")
+async def websocket_transcribe_file(websocket: WebSocket):
+    """
+    流式转写音频文件
+    接收音频/视频 URL，以流式方式返回识别结果
+    
+    使用方式：
+    1. 连接 WebSocket
+    2. 发送 JSON: {"audio_url": "https://...", "lang": "zh"}
+    3. 等待服务器返回识别结果（流式返回）
+    4. 接收完成后断开连接
+    """
+    try:
+        await websocket.accept()
+        
+        # 接收初始消息（包含音频 URL）
+        initial_msg = await websocket.receive_text()
+        try:
+            request_data = json.loads(initial_msg)
+            audio_url = request_data.get('audio_url')
+            lang = request_data.get('lang', 'zh')
+            if not audio_url:
+                await websocket.send_json({
+                    "code": -1,
+                    "msg": "缺少 audio_url 参数",
+                    "data": None
+                })
+                await websocket.close()
+                return
+        except json.JSONDecodeError:
+            await websocket.send_json({
+                "code": -1,
+                "msg": "无法解析 JSON 请求",
+                "data": None
+            })
+            await websocket.close()
+            return
+        
+        logger.info(f"[流式转写] 开始处理音频: {audio_url}")
+        
+        # 记录总开始时间
+        total_start_time = time.time()
+        
+        # 发送开始处理消息
+        await websocket.send_json({
+            "code": 10,
+            "msg": "开始下载音频",
+            "data": None
+        })
+        
+        # 下载并处理音频
+        download_start_time = time.time()
+        try:
+            audio_data = await download_and_process_audio(audio_url)
+        except Exception as e:
+            await websocket.send_json({
+                "code": -1,
+                "msg": f"音频下载或处理失败: {str(e)}",
+                "data": None
+            })
+            await websocket.close()
+            return
+        
+        download_elapsed = time.time() - download_start_time
+        audio_duration = len(audio_data) / 16000
+        
+        # 发送下载完成消息
+        await websocket.send_json({
+            "code": 11,
+            "msg": "音频下载完成，开始识别",
+            "data": {
+                "duration": audio_duration,
+                "download_time": download_elapsed
+            }
+        })
+        
+        # 记录识别开始时间
+        recognition_start_time = time.time()
+        
+        # 使用固定的分块大小（比如5秒一块），不用 VAD
+        chunk_duration = 5.0  # 5秒
+        chunk_samples = int(chunk_duration * config.sample_rate)
+        
+        # 初始化
+        speaker_embeddings = {}
+        segment_count = 0
+        
+        # 简单分块处理音频
+        total_chunks = (len(audio_data) + chunk_samples - 1) // chunk_samples
+        
+        for i in range(0, len(audio_data), chunk_samples):
+            chunk = audio_data[i:i + chunk_samples]
+            chunk_idx = i // chunk_samples + 1
+            
+            # 说话人识别
+            speaker_id, is_new_speaker = identify_speaker(
+                chunk,
+                speaker_embeddings,
+                config.sd_thr
+            )
+            
+            # 发送新说话人通知
+            if is_new_speaker and speaker_id is not None:
+                await websocket.send_json({
+                    "code": 4,
+                    "msg": "new_speaker_detected",
+                    "data": speaker_id,
+                    "speaker": speaker_id
+                })
+            
+            # ASR 识别（对当前块进行识别）
+            result = model_asr.generate(
+                input=chunk,
+                cache={},
+                language=lang.strip(),
+                use_itn=True,
+                batch_size_s=60,
+            )
+            
+            # 检查 ASR 结果
+            if result and len(result) > 0 and 'text' in result[0]:
+                text = result[0]['text']
+                # 移除特殊标记
+                clean_text = format_str_v3(text)
+                
+                # 如果文本不为空，发送结果
+                if clean_text and len(clean_text.strip()) > 0:
+                    segment_count += 1
+                    
+                    # 发送识别结果
+                    await websocket.send_json({
+                        "code": 0,
+                        "msg": "transcription_result",
+                        "data": clean_text,
+                        "speaker": speaker_id,
+                        "info": json.dumps(result[0], ensure_ascii=False)
+                    })
+            
+            # 发送进度
+            progress = (chunk_idx / total_chunks) * 100
+            await websocket.send_json({
+                "code": 12,
+                "msg": "处理进度",
+                "data": {
+                    "processed": chunk_idx,
+                    "total": total_chunks,
+                    "progress": progress
+                }
+            })
+        
+        # 计算总耗时
+        recognition_elapsed = time.time() - recognition_start_time
+        total_elapsed = time.time() - total_start_time
+        
+        # 发送完成消息（包含统计信息）
+        await websocket.send_json({
+            "code": 100,
+            "msg": "转写完成",
+            "data": {
+                "total_time": total_elapsed,
+                "download_time": download_elapsed,
+                "recognition_time": recognition_elapsed,
+                "audio_duration": audio_duration,
+                "segment_count": segment_count,
+                "speed_ratio": audio_duration / total_elapsed if total_elapsed > 0 else 0
+            }
+        })
+        
+        logger.info(f"[流式转写] 统计信息 - 总耗时: {total_elapsed:.2f}s, 下载: {download_elapsed:.2f}s, 识别: {recognition_elapsed:.2f}s, 音频时长: {audio_duration:.2f}s, 处理速度: {audio_duration/total_elapsed:.2f}x")
+        
+    except WebSocketDisconnect:
+        logger.info("[流式转写] WebSocket 断开连接")
+    except Exception as e:
+        logger.error(f"[流式转写] 错误: {e}\n{traceback.format_exc()}")
+        try:
+            await websocket.send_json({
+                "code": -1,
+                "msg": f"处理失败: {str(e)}",
+                "data": None
+            })
+        except:
+            pass
+    finally:
+        await websocket.close()
 
 
 if __name__ == "__main__":

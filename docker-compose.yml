@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  # WebSocket 服务
+  sensevoice-wss:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sensevoice-wss
+    ports:
+      - "27100:27100"
+    volumes:
+      - ~/.cache/modelscope:/root/.cache/modelscope
+      - ./speaker:/app/speaker
+      - ./outputs:/app/outputs
+    restart: unless-stopped
+    command: python server_wss_v3.py --port 27100
+    # GPU 支持（如果有 NVIDIA GPU）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # HTTP API 服务
+  sensevoice-http:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sensevoice-http
+    ports:
+      - "7007:7007"
+    volumes:
+      - ~/.cache/modelscope:/root/.cache/modelscope
+      - ./speaker:/app/speaker
+      - ./outputs:/app/outputs
+    restart: unless-stopped
+    command: python server.py --port 7007
+    # GPU 支持（如果有 NVIDIA GPU）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
